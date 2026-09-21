@@ -59,7 +59,15 @@ class DivergenceDetector:
                 abnormal_context=self._empty_context(),
             )
 
-        item = diff_result.items[0]
+        return self.detect_item(diff_result.items[0], normal_lines, abnormal_lines)
+
+    def detect_item(
+        self,
+        item: DiffItem,
+        normal_lines: Sequence[NormalizedLine],
+        abnormal_lines: Sequence[NormalizedLine],
+    ) -> FirstDivergence:
+        """Build a divergence view for an arbitrary item in the diff list."""
         normal_anchor = self._anchor(item, side="normal", length=len(normal_lines))
         abnormal_anchor = self._anchor(item, side="abnormal", length=len(abnormal_lines))
         normal_context = self._context(normal_lines, normal_anchor, item.normal_line)

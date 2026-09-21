@@ -10,7 +10,7 @@ from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
 try:
-    from ..core.diff_engine import DiffEngine, DiffResult, DiffType
+    from ..core.diff_engine import DiffEngine, DiffItem, DiffResult, DiffType
     from ..core.divergence import ContextWindow, FirstDivergence, DivergenceDetector
     from ..core.log_loader import LogLoadError, LogLoader
     from ..core.normalizer import (
@@ -24,7 +24,7 @@ except ImportError:
     project_root = Path(__file__).resolve().parents[2]
     if str(project_root) not in sys.path:
         sys.path.insert(0, str(project_root))
-    from src.core.diff_engine import DiffEngine, DiffResult, DiffType
+    from src.core.diff_engine import DiffEngine, DiffItem, DiffResult, DiffType
     from src.core.divergence import ContextWindow, FirstDivergence, DivergenceDetector
     from src.core.log_loader import LogLoadError, LogLoader
     from src.core.normalizer import (
@@ -52,6 +52,7 @@ class MainWindow:
         self._last_diff_result: DiffResult | None = None
         self._last_normal_lines: list[NormalizedLine] = []
         self._last_abnormal_lines: list[NormalizedLine] = []
+        self._selected_diff_item: DiffItem | None = None
 
         self.normal_text: tk.Text
         self.abnormal_text: tk.Text
@@ -343,6 +344,7 @@ class MainWindow:
             "normal",
             self.show_normalized.get(),
             self._last_diff_result,
+            self._selected_diff_item,
         )
         self._render_context(
             self.abnormal_text,
@@ -351,6 +353,7 @@ class MainWindow:
             "abnormal",
             self.show_normalized.get(),
             self._last_diff_result,
+            self._selected_diff_item,
         )
 
     def _show_all_diffs(self) -> None:
@@ -395,10 +398,14 @@ class MainWindow:
             DiffType.ADDED: "追加 (ADDED)",
             DiffType.CHANGED: "変更 (CHANGED)",
         }
+        diff_items: dict[str, DiffItem] = {}
         for number, item in enumerate(self._last_diff_result.items, start=1):
+            item_id = f"diff-{number}"
+            diff_items[item_id] = item
             tree.insert(
                 "",
                 tk.END,
+                iid=item_id,
                 values=(
                     number,
                     type_names[item.type],
@@ -406,6 +413,10 @@ class MainWindow:
                     self._diff_line_text(item.abnormal_line),
                 ),
             )
+        tree.bind(
+            "<<TreeviewSelect>>",
+            lambda _event: self._jump_to_selected_diff(tree, diff_items),
+        )
 
         ttk.Label(
             window,
@@ -415,6 +426,38 @@ class MainWindow:
                 f"変更: {self._last_diff_result.changed_count}"
             ),
         ).pack(anchor=tk.W, padx=12, pady=(8, 12))
+
+    def _jump_to_selected_diff(self, tree: ttk.Treeview, diff_items: dict[str, DiffItem]) -> None:
+        selection = tree.selection()
+        if not selection:
+            return
+        item = diff_items.get(selection[0])
+        if item is None:
+            return
+        selected_divergence = DivergenceDetector().detect_item(
+            item, self._last_normal_lines, self._last_abnormal_lines
+        )
+        self._selected_diff_item = item
+        self._last_divergence = selected_divergence
+        self._render_context(
+            self.normal_text,
+            selected_divergence.normal_context,
+            selected_divergence,
+            "normal",
+            self.show_normalized.get(),
+            self._last_diff_result,
+            self._selected_diff_item,
+        )
+        self._render_context(
+            self.abnormal_text,
+            selected_divergence.abnormal_context,
+            selected_divergence,
+            "abnormal",
+            self.show_normalized.get(),
+            self._last_diff_result,
+            self._selected_diff_item,
+        )
+        self.status_text.set("選択した相違点の位置を表示中")
 
     def _diff_line_text(self, line: NormalizedLine | None) -> str:
         if line is None:
@@ -466,6 +509,8 @@ class MainWindow:
             "■ 正規化後のログを見る\n"
             "上部メニューの「表示」→「正規化後のログを表示」を選ぶと、比較に使った文字列を表示できます。\n"
             "もう一度選ぶと元ログ表示に戻ります。\n\n"
+            "■ 全相違点から該当箇所へ移動する\n"
+            "解析後に「全相違点を表示」を開き、一覧の行を選ぶと、その差分の前後ログへ移動します。\n\n"
             "■ 正規化ログを保存する\n"
             "解析後に「ファイル」→「正規化ログを保存」を選び、保存先フォルダを指定します。\n"
             "次の2ファイルが作成されます。\n"
@@ -581,6 +626,7 @@ class MainWindow:
             font=("Consolas", 10),
         )
         widget.tag_configure("focus", background="#fff2a8", foreground="#000000")
+        widget.tag_configure("selected", underline=True)
         widget.tag_configure("difference", background="#ffe0b2", foreground="#7a3e00")
         widget.tag_configure(
             "marker",
@@ -624,6 +670,7 @@ class MainWindow:
         self._last_diff_result = diff_result
         self._last_normal_lines = normal_lines
         self._last_abnormal_lines = abnormal_lines
+        self._selected_diff_item = diff_result.items[0] if diff_result.items else None
         self._render_context(
             self.normal_text,
             divergence.normal_context,
@@ -631,6 +678,7 @@ class MainWindow:
             "normal",
             self.show_normalized.get(),
             diff_result,
+            self._selected_diff_item,
         )
         self._render_context(
             self.abnormal_text,
@@ -639,6 +687,7 @@ class MainWindow:
             "abnormal",
             self.show_normalized.get(),
             diff_result,
+            self._selected_diff_item,
         )
         self._render_summary(divergence, diff_result.missing_count, diff_result.added_count, diff_result.changed_count)
         warning_count = len(normal_result.warnings) + len(abnormal_result.warnings)
@@ -654,7 +703,11 @@ class MainWindow:
         side: str,
         show_normalized: bool,
         diff_result: DiffResult | None,
+        selected_item: DiffItem | None,
     ) -> None:
+        first_item = diff_result.items[0] if diff_result and diff_result.items else None
+        first_line_numbers = MainWindow._item_line_numbers(first_item, side)
+        selected_line_numbers = MainWindow._item_line_numbers(selected_item, side)
         difference_line_numbers = {
             line.line_number
             for item in (diff_result.items if diff_result else [])
@@ -665,7 +718,7 @@ class MainWindow:
             )
             if line is not None
         }
-        missing_markers: dict[int, str] = {}
+        missing_markers: dict[int, tuple[str, bool]] = {}
         if side == "abnormal" and diff_result is not None:
             for item in diff_result.items:
                 if item.type is not DiffType.MISSING or item.normal_line is None:
@@ -684,54 +737,47 @@ class MainWindow:
                 missing_markers[marker_index] = (
                     "← 欠落: "
                     + (item.normal_line.normalized_text if show_normalized else item.normal_line.raw_text)
-                    + "\n"
+                    + "\n",
+                    item == selected_item,
                 )
         widget.configure(state=tk.NORMAL)
         widget.delete("1.0", tk.END)
-        marker_index = None
-        if context.focus_index is None and side == "abnormal" and divergence.observed is None:
-            if divergence.next is not None:
-                marker_index = next(
-                    (
-                        index
-                        for index, line in enumerate(context.lines)
-                        if line.line_number == divergence.next.line_number
-                    ),
-                    len(context.lines),
-                )
-            else:
-                marker_index = len(context.lines)
         for index, line in enumerate(context.lines):
             if index in missing_markers:
                 marker_start = widget.index("end-1c")
-                widget.insert(tk.END, missing_markers[index])
+                marker_text, is_selected = missing_markers[index]
+                widget.insert(tk.END, marker_text)
                 marker_end = widget.index("end-1c")
                 widget.tag_add("marker", marker_start, marker_end)
-            if marker_index == index:
-                marker_start = widget.index("end-1c")
-                widget.insert(tk.END, "← ここが最初の相違点です（本来の行が見つかりません）\n")
-                marker_end = widget.index("end-1c")
-                widget.tag_add("marker", marker_start, marker_end)
+                if is_selected:
+                    widget.tag_add("selected", marker_start, marker_end)
             displayed_text = line.normalized_text if show_normalized else line.raw_text
             text = f"{line.line_number:>6}: {displayed_text}\n"
             start = widget.index("end-1c")
             widget.insert(tk.END, text)
             end = widget.index("end-1c")
-            if context.focus_index == index:
+            if line.line_number in first_line_numbers:
                 widget.tag_add("focus", start, end)
-            elif line.line_number in difference_line_numbers:
+            if line.line_number in selected_line_numbers:
+                widget.tag_add("selected", start, end)
+            elif line.line_number not in first_line_numbers and line.line_number in difference_line_numbers:
                 widget.tag_add("difference", start, end)
-        if marker_index == len(context.lines):
-            marker_start = widget.index("end-1c")
-            widget.insert(tk.END, "← ここが最初の相違点です（本来の行が見つかりません）\n")
-            marker_end = widget.index("end-1c")
-            widget.tag_add("marker", marker_start, marker_end)
         if len(context.lines) in missing_markers:
             marker_start = widget.index("end-1c")
-            widget.insert(tk.END, missing_markers[len(context.lines)])
+            marker_text, is_selected = missing_markers[len(context.lines)]
+            widget.insert(tk.END, marker_text)
             marker_end = widget.index("end-1c")
             widget.tag_add("marker", marker_start, marker_end)
+            if is_selected:
+                widget.tag_add("selected", marker_start, marker_end)
         widget.configure(state=tk.DISABLED)
+
+    @staticmethod
+    def _item_line_numbers(item: DiffItem | None, side: str) -> set[int]:
+        if item is None:
+            return set()
+        line = item.normal_line if side == "normal" else item.abnormal_line
+        return {line.line_number} if line is not None else set()
 
     def _render_summary(self, divergence: FirstDivergence, missing: int, added: int, changed: int) -> None:
         if not divergence.found:

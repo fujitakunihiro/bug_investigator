@@ -110,6 +110,17 @@ class DivergenceDetectorTests(unittest.TestCase):
         self.assertEqual(result.normal_context.lines[0].normalized_text, "A")
         self.assertEqual(result.abnormal_context.lines, [])
 
+    def test_can_build_context_for_a_later_difference(self) -> None:
+        normal = normalized_lines(["A", "B", "C"], "normal")
+        abnormal = normalized_lines(["A", "X", "C"], "abnormal")
+        diff = self.engine.compare(normal, abnormal)
+
+        result = self.detector.detect_item(diff.items[0], normal, abnormal)
+
+        self.assertEqual(result.type, DiffType.CHANGED)
+        self.assertEqual(result.expected.normalized_text, "B")
+        self.assertEqual(result.observed.normalized_text, "X")
+
 
 if __name__ == "__main__":
     unittest.main()
