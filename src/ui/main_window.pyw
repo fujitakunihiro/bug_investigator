@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import tkinter as tk
 import sys
+import json
+import os
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
 try:
-    from ..core.diff_engine import DiffEngine
+    from ..core.diff_engine import DiffEngine, DiffResult, DiffType
     from ..core.divergence import ContextWindow, FirstDivergence, DivergenceDetector
     from ..core.log_loader import LogLoadError, LogLoader
     from ..core.normalizer import Normalizer, NormalizationConfigError, NormalizedLine
@@ -17,7 +19,7 @@ except ImportError:
     project_root = Path(__file__).resolve().parents[2]
     if str(project_root) not in sys.path:
         sys.path.insert(0, str(project_root))
-    from src.core.diff_engine import DiffEngine
+    from src.core.diff_engine import DiffEngine, DiffResult, DiffType
     from src.core.divergence import ContextWindow, FirstDivergence, DivergenceDetector
     from src.core.log_loader import LogLoadError, LogLoader
     from src.core.normalizer import Normalizer, NormalizationConfigError, NormalizedLine
@@ -34,6 +36,10 @@ class MainWindow:
         self.normal_path = tk.StringVar()
         self.abnormal_path = tk.StringVar()
         self.status_text = tk.StringVar(value="正常ログと異常ログを指定してください")
+        self._load_last_paths()
+        self.show_normalized = tk.BooleanVar(value=False)
+        self._last_divergence: FirstDivergence | None = None
+        self._last_diff_result: DiffResult | None = None
 
         self.normal_text: tk.Text
         self.abnormal_text: tk.Text
@@ -76,6 +82,21 @@ class MainWindow:
         self._add_scrollbar(normal_frame, self.normal_text)
         self._add_scrollbar(abnormal_frame, self.abnormal_text)
 
+        legend = ttk.LabelFrame(container, text="行の色の意味", padding=(8, 4))
+        legend.pack(fill=tk.X, pady=(0, 8))
+        ttk.Label(legend, text="黄色:").pack(side=tk.LEFT)
+        tk.Label(legend, text=" 最初の相違点 ", background="#fff2a8").pack(
+            side=tk.LEFT, padx=(2, 14)
+        )
+        ttk.Label(legend, text="橙色:").pack(side=tk.LEFT)
+        tk.Label(legend, text=" 後続の相違点 ", background="#ffe0b2").pack(
+            side=tk.LEFT, padx=(2, 14)
+        )
+        ttk.Label(legend, text="赤色:").pack(side=tk.LEFT)
+        tk.Label(legend, text=" 欠落位置の案内 ", background="#ffd6d6", foreground="#b00020").pack(
+            side=tk.LEFT, padx=2
+        )
+
         summary = ttk.LabelFrame(container, text="最初の相違点（FIRST DIVERGENCE）", padding=8)
         summary.pack(fill=tk.X)
         ttk.Label(
@@ -84,14 +105,116 @@ class MainWindow:
             justify=tk.LEFT,
             anchor=tk.W,
         ).pack(fill=tk.X)
+        ttk.Button(
+            summary,
+            text="全相違点を表示",
+            command=self._show_all_diffs,
+        ).pack(anchor=tk.E, pady=(8, 0))
 
     def _build_menu(self) -> None:
         menu_bar = tk.Menu(self.root)
+        view_menu = tk.Menu(menu_bar, tearoff=False)
+        view_menu.add_checkbutton(
+            label="正規化後のログを表示",
+            variable=self.show_normalized,
+            command=self._refresh_views,
+        )
+        view_menu.add_separator()
+        view_menu.add_command(label="全相違点を表示", command=self._show_all_diffs)
+        menu_bar.add_cascade(label="表示", menu=view_menu)
         help_menu = tk.Menu(menu_bar, tearoff=False)
         help_menu.add_command(label="使い方", command=self._show_help)
         help_menu.add_command(label="このツールについて", command=self._show_about)
         menu_bar.add_cascade(label="ヘルプ", menu=help_menu)
         self.root.config(menu=menu_bar)
+
+    def _refresh_views(self) -> None:
+        if self._last_divergence is None:
+            return
+        self._render_context(
+            self.normal_text,
+            self._last_divergence.normal_context,
+            self._last_divergence,
+            "normal",
+            self.show_normalized.get(),
+            self._last_diff_result,
+        )
+        self._render_context(
+            self.abnormal_text,
+            self._last_divergence.abnormal_context,
+            self._last_divergence,
+            "abnormal",
+            self.show_normalized.get(),
+            self._last_diff_result,
+        )
+
+    def _show_all_diffs(self) -> None:
+        if self._last_diff_result is None:
+            messagebox.showinfo("全相違点", "先に解析を実行してください。")
+            return
+
+        window = tk.Toplevel(self.root)
+        window.title("全相違点")
+        window.geometry("980x520")
+        window.minsize(760, 400)
+        window.transient(self.root)
+
+        frame = ttk.Frame(window, padding=12)
+        frame.pack(fill=tk.BOTH, expand=True)
+        ttk.Label(
+            frame,
+            text=(
+                "全相違点一覧（後続の差分を含む）\n"
+                "一覧の行を選択すると、正常側・異常側の内容を確認できます。"
+            ),
+            justify=tk.LEFT,
+        ).pack(anchor=tk.W, pady=(0, 8))
+
+        columns = ("number", "type", "normal", "abnormal")
+        tree = ttk.Treeview(frame, columns=columns, show="headings", selectmode="browse")
+        tree.heading("number", text="No.")
+        tree.heading("type", text="種別")
+        tree.heading("normal", text="正常ログ")
+        tree.heading("abnormal", text="異常ログ")
+        tree.column("number", width=55, anchor=tk.CENTER, stretch=False)
+        tree.column("type", width=100, anchor=tk.CENTER, stretch=False)
+        tree.column("normal", width=360)
+        tree.column("abnormal", width=360)
+        tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scrollbar = ttk.Scrollbar(frame, orient=tk.VERTICAL, command=tree.yview)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        tree.configure(yscrollcommand=scrollbar.set)
+
+        type_names = {
+            DiffType.MISSING: "欠落 (MISSING)",
+            DiffType.ADDED: "追加 (ADDED)",
+            DiffType.CHANGED: "変更 (CHANGED)",
+        }
+        for number, item in enumerate(self._last_diff_result.items, start=1):
+            tree.insert(
+                "",
+                tk.END,
+                values=(
+                    number,
+                    type_names[item.type],
+                    self._diff_line_text(item.normal_line),
+                    self._diff_line_text(item.abnormal_line),
+                ),
+            )
+
+        ttk.Label(
+            window,
+            text=(
+                f"欠落: {self._last_diff_result.missing_count} / "
+                f"追加: {self._last_diff_result.added_count} / "
+                f"変更: {self._last_diff_result.changed_count}"
+            ),
+        ).pack(anchor=tk.W, padx=12, pady=(8, 12))
+
+    def _diff_line_text(self, line: NormalizedLine | None) -> str:
+        if line is None:
+            return "—"
+        return line.normalized_text if self.show_normalized.get() else line.raw_text
 
     def _show_help(self) -> None:
         help_window = tk.Toplevel(self.root)
@@ -131,6 +254,13 @@ class MainWindow:
             "左側の NORMAL は正常ログ、右側の ABNORMAL は異常ログです。\n"
             "黄色で強調された行、または赤色の相違点マーカーが、最初に挙動が異なった地点です。\n"
             "その前後にあるログを確認し、調査を開始する位置を判断してください。\n\n"
+            "■ 行の色の意味\n"
+            "黄色: 最初の相違点です。今回の調査で最も優先して確認する場所です。\n"
+            "橙色: 最初の相違点より後に見つかった相違点です。\n"
+            "赤色: 欠落した行が入るはずだった位置を示します。\n\n"
+            "■ 正規化後のログを見る\n"
+            "上部メニューの「表示」→「正規化後のログを表示」を選ぶと、比較に使った文字列を表示できます。\n"
+            "もう一度選ぶと元ログ表示に戻ります。\n\n"
             "■ 差分の種類\n"
             "MISSING（欠落）\n"
             "  正常ログには存在する行が、異常ログで見つかりません。\n"
@@ -172,14 +302,53 @@ class MainWindow:
         ).grid(row=row, column=2, pady=3)
         parent.columnconfigure(1, weight=1)
 
-    @staticmethod
-    def _choose_file(variable: tk.StringVar) -> None:
+    def _choose_file(self, variable: tk.StringVar) -> None:
         path = filedialog.askopenfilename(
             title="ログファイルを選択",
             filetypes=[("Log files", "*.log *.txt"), ("All files", "*.*")],
         )
         if path:
             variable.set(path)
+            self._save_last_paths()
+
+    @staticmethod
+    def _settings_path() -> Path:
+        app_data = os.environ.get("APPDATA")
+        base_dir = Path(app_data) if app_data else Path.home() / "AppData" / "Roaming"
+        return base_dir / "BugInvestigator" / "settings.json"
+
+    def _load_last_paths(self) -> None:
+        try:
+            with self._settings_path().open("r", encoding="utf-8") as handle:
+                settings = json.load(handle)
+            if isinstance(settings, dict):
+                normal = settings.get("normal_log")
+                abnormal = settings.get("abnormal_log")
+                if isinstance(normal, str):
+                    self.normal_path.set(normal)
+                if isinstance(abnormal, str):
+                    self.abnormal_path.set(abnormal)
+        except (OSError, json.JSONDecodeError, TypeError):
+            # Initial launch or unreadable settings must not block the UI.
+            return
+
+    def _save_last_paths(self) -> None:
+        try:
+            settings_path = self._settings_path()
+            settings_path.parent.mkdir(parents=True, exist_ok=True)
+            with settings_path.open("w", encoding="utf-8") as handle:
+                json.dump(
+                    {
+                        "normal_log": self.normal_path.get(),
+                        "abnormal_log": self.abnormal_path.get(),
+                    },
+                    handle,
+                    ensure_ascii=False,
+                    indent=2,
+                )
+        except OSError:
+            # Remembering paths is optional; analysis must continue if it fails.
+            return
 
     @staticmethod
     def _create_log_view(parent: tk.Misc) -> tk.Text:
@@ -192,6 +361,7 @@ class MainWindow:
             font=("Consolas", 10),
         )
         widget.tag_configure("focus", background="#fff2a8", foreground="#000000")
+        widget.tag_configure("difference", background="#ffe0b2", foreground="#7a3e00")
         widget.tag_configure(
             "marker",
             background="#ffd6d6",
@@ -212,6 +382,7 @@ class MainWindow:
         if not normal_path or not abnormal_path:
             messagebox.showwarning("入力不足", "正常ログと異常ログの両方を指定してください。")
             return
+        self._save_last_paths()
 
         try:
             loader = LogLoader()
@@ -229,9 +400,23 @@ class MainWindow:
             messagebox.showerror("解析エラー", str(exc))
             return
 
-        self._render_context(self.normal_text, divergence.normal_context, divergence, "normal")
+        self._last_divergence = divergence
+        self._last_diff_result = diff_result
         self._render_context(
-            self.abnormal_text, divergence.abnormal_context, divergence, "abnormal"
+            self.normal_text,
+            divergence.normal_context,
+            divergence,
+            "normal",
+            self.show_normalized.get(),
+            diff_result,
+        )
+        self._render_context(
+            self.abnormal_text,
+            divergence.abnormal_context,
+            divergence,
+            "abnormal",
+            self.show_normalized.get(),
+            diff_result,
         )
         self._render_summary(divergence, diff_result.missing_count, diff_result.added_count, diff_result.changed_count)
         warning_count = len(normal_result.warnings) + len(abnormal_result.warnings)
@@ -245,7 +430,40 @@ class MainWindow:
         context: ContextWindow,
         divergence: FirstDivergence,
         side: str,
+        show_normalized: bool,
+        diff_result: DiffResult | None,
     ) -> None:
+        difference_line_numbers = {
+            line.line_number
+            for item in (diff_result.items if diff_result else [])
+            for line in (
+                [item.normal_line]
+                if side == "normal"
+                else [item.abnormal_line]
+            )
+            if line is not None
+        }
+        missing_markers: dict[int, str] = {}
+        if side == "abnormal" and diff_result is not None:
+            for item in diff_result.items:
+                if item.type is not DiffType.MISSING or item.normal_line is None:
+                    continue
+                anchor = item.abnormal_index
+                if anchor is None:
+                    anchor = item.normal_index
+                marker_index = next(
+                    (
+                        index
+                        for index, line in enumerate(context.lines)
+                        if line.line_number >= (anchor + 1 if anchor is not None else 1)
+                    ),
+                    len(context.lines),
+                )
+                missing_markers[marker_index] = (
+                    "← 欠落: "
+                    + (item.normal_line.normalized_text if show_normalized else item.normal_line.raw_text)
+                    + "\n"
+                )
         widget.configure(state=tk.NORMAL)
         widget.delete("1.0", tk.END)
         marker_index = None
@@ -262,20 +480,33 @@ class MainWindow:
             else:
                 marker_index = len(context.lines)
         for index, line in enumerate(context.lines):
+            if index in missing_markers:
+                marker_start = widget.index("end-1c")
+                widget.insert(tk.END, missing_markers[index])
+                marker_end = widget.index("end-1c")
+                widget.tag_add("marker", marker_start, marker_end)
             if marker_index == index:
                 marker_start = widget.index("end-1c")
                 widget.insert(tk.END, "← ここが最初の相違点です（本来の行が見つかりません）\n")
                 marker_end = widget.index("end-1c")
                 widget.tag_add("marker", marker_start, marker_end)
-            text = f"{line.line_number:>6}: {line.raw_text}\n"
+            displayed_text = line.normalized_text if show_normalized else line.raw_text
+            text = f"{line.line_number:>6}: {displayed_text}\n"
             start = widget.index("end-1c")
             widget.insert(tk.END, text)
             end = widget.index("end-1c")
             if context.focus_index == index:
                 widget.tag_add("focus", start, end)
+            elif line.line_number in difference_line_numbers:
+                widget.tag_add("difference", start, end)
         if marker_index == len(context.lines):
             marker_start = widget.index("end-1c")
             widget.insert(tk.END, "← ここが最初の相違点です（本来の行が見つかりません）\n")
+            marker_end = widget.index("end-1c")
+            widget.tag_add("marker", marker_start, marker_end)
+        if len(context.lines) in missing_markers:
+            marker_start = widget.index("end-1c")
+            widget.insert(tk.END, missing_markers[len(context.lines)])
             marker_end = widget.index("end-1c")
             widget.tag_add("marker", marker_start, marker_end)
         widget.configure(state=tk.DISABLED)

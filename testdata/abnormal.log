@@ -1,4 +1,4 @@
 11:00:00.000 PowerOn
-11:00:00.010 ClockStart
+11:00:00.010 ClockStart 2
 11:00:00.030 PanelInit
 11:00:00.040 DisplayStart
