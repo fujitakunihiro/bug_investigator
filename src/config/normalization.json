@@ -1,0 +1,14 @@
+{
+  "rules": [
+    {
+      "name": "timestamp",
+      "pattern": "\\b\\d{2}:\\d{2}:\\d{2}(?:[.,]\\d{3,6})?\\b",
+      "replacement": "<TIMESTAMP>"
+    },
+    {
+      "name": "hex_address",
+      "pattern": "\\b0[xX][0-9A-Fa-f]+\\b",
+      "replacement": "<ADDR>"
+    }
+  ]
+}

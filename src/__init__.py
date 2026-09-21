@@ -1,0 +1,1 @@
+"""Bug Investigator application package."""
