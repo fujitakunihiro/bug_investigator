@@ -6,6 +6,8 @@ import tkinter as tk
 import sys
 import json
 import os
+import shutil
+import subprocess
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
@@ -56,7 +58,8 @@ class MainWindow:
 
         self.normal_text: tk.Text
         self.abnormal_text: tk.Text
-        self.summary_text = tk.StringVar(value="FIRST DIVERGENCE\n未解析")
+        self.summary_title = tk.StringVar(value="最初の相違点（FIRST DIVERGENCE）")
+        self.summary_text = tk.StringVar(value="未解析")
         self._build()
 
     def _build(self) -> None:
@@ -110,8 +113,18 @@ class MainWindow:
             side=tk.LEFT, padx=2
         )
 
-        summary = ttk.LabelFrame(container, text="最初の相違点（FIRST DIVERGENCE）", padding=8)
+        summary = ttk.LabelFrame(
+            container,
+            text="相違点の詳細",
+            padding=8,
+        )
         summary.pack(fill=tk.X)
+        ttk.Label(
+            summary,
+            textvariable=self.summary_title,
+            font=("Segoe UI", 10, "bold"),
+            anchor=tk.W,
+        ).pack(fill=tk.X, pady=(0, 4))
         ttk.Label(
             summary,
             textvariable=self.summary_text,
@@ -128,6 +141,10 @@ class MainWindow:
         menu_bar = tk.Menu(self.root)
         file_menu = tk.Menu(menu_bar, tearoff=False)
         file_menu.add_command(label="正規化ログを保存", command=self._export_normalized_logs)
+        file_menu.add_command(
+            label="正規化ログを保存してWinMergeで開く",
+            command=self._export_and_open_winmerge,
+        )
         menu_bar.add_cascade(label="ファイル", menu=file_menu)
         view_menu = tk.Menu(menu_bar, tearoff=False)
         view_menu.add_checkbutton(
@@ -148,6 +165,12 @@ class MainWindow:
         self.root.config(menu=menu_bar)
 
     def _export_normalized_logs(self) -> None:
+        self._export_normalized_logs_impl(open_winmerge=False)
+
+    def _export_and_open_winmerge(self) -> None:
+        self._export_normalized_logs_impl(open_winmerge=True)
+
+    def _export_normalized_logs_impl(self, open_winmerge: bool) -> None:
         if not self._last_normal_lines and not self._last_abnormal_lines:
             messagebox.showinfo("正規化ログの保存", "先に解析を実行してください。")
             return
@@ -168,12 +191,48 @@ class MainWindow:
             messagebox.showerror("保存エラー", str(exc))
             return
 
+        if open_winmerge:
+            winmerge = self._find_winmerge()
+            if winmerge is None:
+                messagebox.showinfo(
+                    "WinMergeが見つかりません",
+                    "正規化ログは保存しましたが、WinMergeを見つけられませんでした。\n\n"
+                    f"正常: {normal_path}\n"
+                    f"異常: {abnormal_path}",
+                )
+                return
+            try:
+                subprocess.Popen([str(winmerge), str(normal_path), str(abnormal_path)])
+            except OSError as exc:
+                messagebox.showerror("WinMerge起動エラー", str(exc))
+                return
+
         messagebox.showinfo(
             "保存完了",
-            "正規化ログを保存しました。\n\n"
+            (
+                "正規化ログを保存し、WinMergeを起動しました。"
+                if open_winmerge
+                else "正規化ログを保存しました。"
+            )
+            + "\n\n"
             f"正常: {normal_path}\n"
             f"異常: {abnormal_path}",
         )
+
+    @staticmethod
+    def _find_winmerge() -> Path | None:
+        executable = shutil.which("WinMergeU.exe") or shutil.which("WinMerge.exe")
+        if executable:
+            return Path(executable)
+        candidates = (
+            Path(os.environ.get("ProgramFiles", "C:\\Program Files"))
+            / "WinMerge"
+            / "WinMergeU.exe",
+            Path(os.environ.get("ProgramFiles(x86)", "C:\\Program Files (x86)"))
+            / "WinMerge"
+            / "WinMergeU.exe",
+        )
+        return next((path for path in candidates if path.exists()), None)
 
     @staticmethod
     def _write_normalized_log(path: Path, lines: list[NormalizedLine]) -> None:
@@ -230,6 +289,28 @@ class MainWindow:
         self._rule_entry(editor, 1, "正規表現", pattern_var)
         self._rule_entry(editor, 2, "置換文字列", replacement_var)
 
+        preview = ttk.LabelFrame(outer, text="正規化ルールのプレビュー", padding=8)
+        preview.pack(fill=tk.X, pady=(10, 0))
+        preview_input = tk.StringVar(value="10:00:00.123 PanelOpen addr=0x1234")
+        preview_result = tk.StringVar(value="")
+        ttk.Label(preview, text="入力例", width=14).grid(row=0, column=0, sticky=tk.W, pady=3)
+        ttk.Entry(preview, textvariable=preview_input).grid(
+            row=0, column=1, sticky=tk.EW, padx=(0, 8), pady=3
+        )
+        ttk.Button(
+            preview,
+            text="プレビュー",
+            command=lambda: preview_rules(),
+        ).grid(row=0, column=2, pady=3)
+        ttk.Label(preview, text="変換後", width=14).grid(row=1, column=0, sticky=tk.W, pady=3)
+        ttk.Label(
+            preview,
+            textvariable=preview_result,
+            anchor=tk.W,
+            relief=tk.SUNKEN,
+        ).grid(row=1, column=1, columnspan=2, sticky=tk.EW, pady=3)
+        preview.columnconfigure(1, weight=1)
+
         def select_rule(_event: object) -> None:
             selection = tree.selection()
             if not selection:
@@ -269,6 +350,18 @@ class MainWindow:
                 tree.delete(selected_item[0])
                 clear_editor()
 
+        def preview_rules() -> None:
+            text = preview_input.get()
+            try:
+                for item_id in tree.get_children():
+                    values = tree.item(item_id, "values")
+                    rule = NormalizationRule.create(values[0], values[1], values[2])
+                    text = rule.apply(text)
+            except ValueError as exc:
+                preview_result.set(f"ルールエラー: {exc}")
+                return
+            preview_result.set(text)
+
         def save_rules() -> None:
             payload = {
                 "rules": [
@@ -306,6 +399,7 @@ class MainWindow:
         ttk.Button(buttons, text="入力をクリア", command=clear_editor).pack(side=tk.LEFT, padx=3)
         ttk.Button(buttons, text="保存", command=save_rules).pack(side=tk.LEFT, padx=3)
         ttk.Button(buttons, text="閉じる", command=window.destroy).pack(side=tk.LEFT, padx=3)
+        preview_rules()
 
     @staticmethod
     def _rule_entry(parent: ttk.LabelFrame, row: int, label: str, variable: tk.StringVar) -> None:
@@ -363,8 +457,8 @@ class MainWindow:
 
         window = tk.Toplevel(self.root)
         window.title("全相違点")
-        window.geometry("980x520")
-        window.minsize(760, 400)
+        window.geometry("1180x520")
+        window.minsize(900, 400)
         window.transient(self.root)
 
         frame = ttk.Frame(window, padding=12)
@@ -378,14 +472,25 @@ class MainWindow:
             justify=tk.LEFT,
         ).pack(anchor=tk.W, pady=(0, 8))
 
-        columns = ("number", "type", "normal", "abnormal")
+        columns = (
+            "number",
+            "type",
+            "normal_line",
+            "abnormal_line",
+            "normal",
+            "abnormal",
+        )
         tree = ttk.Treeview(frame, columns=columns, show="headings", selectmode="browse")
         tree.heading("number", text="No.")
         tree.heading("type", text="種別")
+        tree.heading("normal_line", text="正常行")
+        tree.heading("abnormal_line", text="異常行")
         tree.heading("normal", text="正常ログ")
         tree.heading("abnormal", text="異常ログ")
         tree.column("number", width=55, anchor=tk.CENTER, stretch=False)
         tree.column("type", width=100, anchor=tk.CENTER, stretch=False)
+        tree.column("normal_line", width=70, anchor=tk.CENTER, stretch=False)
+        tree.column("abnormal_line", width=70, anchor=tk.CENTER, stretch=False)
         tree.column("normal", width=360)
         tree.column("abnormal", width=360)
         tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
@@ -409,6 +514,8 @@ class MainWindow:
                 values=(
                     number,
                     type_names[item.type],
+                    item.normal_line.line_number if item.normal_line else "—",
+                    item.abnormal_line.line_number if item.abnormal_line else "—",
                     self._diff_line_text(item.normal_line),
                     self._diff_line_text(item.abnormal_line),
                 ),
@@ -439,6 +546,13 @@ class MainWindow:
         )
         self._selected_diff_item = item
         self._last_divergence = selected_divergence
+        self.summary_title.set("選択中の相違点")
+        self._render_summary(
+            selected_divergence,
+            self._last_diff_result.missing_count if self._last_diff_result else 0,
+            self._last_diff_result.added_count if self._last_diff_result else 0,
+            self._last_diff_result.changed_count if self._last_diff_result else 0,
+        )
         self._render_context(
             self.normal_text,
             selected_divergence.normal_context,
@@ -518,11 +632,14 @@ class MainWindow:
             "  abnormal.normalized.log（異常ログの正規化結果）\n"
             "保存した2ファイルはWinMergeなどで開いて、全体の差分を確認できます。\n"
             "元ログは変更されません。\n\n"
+            "「ファイル」→「正規化ログを保存してWinMergeで開く」を選ぶと、保存後にWinMergeを起動できます。\n"
+            "WinMergeがインストールされていない場合は、ログ保存のみ実行されます。\n\n"
             "■ 正規化ルールを設定する\n"
             "「設定」→「正規化ルール設定」を選びます。\n"
             "各ルールには、ルール名・正規表現・置換文字列を指定します。\n"
             "例: 正規表現「id=\\d+」、置換文字列「id=<ID>」\n"
             "「追加／更新」で一覧に反映し、「保存」で設定ファイルに保存します。\n"
+            "画面下部のプレビュー欄に入力例を入れて「プレビュー」を押すと、現在のルールによる変換結果を確認できます。\n"
             "ルールは一覧の上から順番に適用され、保存後の次回解析から反映されます。\n"
             "Timestampと16進アドレスのルールは初期設定されています。\n"
             "正規表現が不正な場合は保存できません。\n\n"
@@ -667,6 +784,7 @@ class MainWindow:
             return
 
         self._last_divergence = divergence
+        self.summary_title.set("最初の相違点（FIRST DIVERGENCE）")
         self._last_diff_result = diff_result
         self._last_normal_lines = normal_lines
         self._last_abnormal_lines = abnormal_lines
