@@ -13,7 +13,12 @@ try:
     from ..core.diff_engine import DiffEngine, DiffResult, DiffType
     from ..core.divergence import ContextWindow, FirstDivergence, DivergenceDetector
     from ..core.log_loader import LogLoadError, LogLoader
-    from ..core.normalizer import Normalizer, NormalizationConfigError, NormalizedLine
+    from ..core.normalizer import (
+        Normalizer,
+        NormalizationConfigError,
+        NormalizationRule,
+        NormalizedLine,
+    )
 except ImportError:
     # Support launching this .pyw directly by double-clicking it in Windows.
     project_root = Path(__file__).resolve().parents[2]
@@ -22,7 +27,12 @@ except ImportError:
     from src.core.diff_engine import DiffEngine, DiffResult, DiffType
     from src.core.divergence import ContextWindow, FirstDivergence, DivergenceDetector
     from src.core.log_loader import LogLoadError, LogLoader
-    from src.core.normalizer import Normalizer, NormalizationConfigError, NormalizedLine
+    from src.core.normalizer import (
+        Normalizer,
+        NormalizationConfigError,
+        NormalizationRule,
+        NormalizedLine,
+    )
 
 
 class MainWindow:
@@ -40,6 +50,8 @@ class MainWindow:
         self.show_normalized = tk.BooleanVar(value=False)
         self._last_divergence: FirstDivergence | None = None
         self._last_diff_result: DiffResult | None = None
+        self._last_normal_lines: list[NormalizedLine] = []
+        self._last_abnormal_lines: list[NormalizedLine] = []
 
         self.normal_text: tk.Text
         self.abnormal_text: tk.Text
@@ -113,6 +125,9 @@ class MainWindow:
 
     def _build_menu(self) -> None:
         menu_bar = tk.Menu(self.root)
+        file_menu = tk.Menu(menu_bar, tearoff=False)
+        file_menu.add_command(label="正規化ログを保存", command=self._export_normalized_logs)
+        menu_bar.add_cascade(label="ファイル", menu=file_menu)
         view_menu = tk.Menu(menu_bar, tearoff=False)
         view_menu.add_checkbutton(
             label="正規化後のログを表示",
@@ -122,11 +137,201 @@ class MainWindow:
         view_menu.add_separator()
         view_menu.add_command(label="全相違点を表示", command=self._show_all_diffs)
         menu_bar.add_cascade(label="表示", menu=view_menu)
+        settings_menu = tk.Menu(menu_bar, tearoff=False)
+        settings_menu.add_command(label="正規化ルール設定", command=self._show_normalization_settings)
+        menu_bar.add_cascade(label="設定", menu=settings_menu)
         help_menu = tk.Menu(menu_bar, tearoff=False)
         help_menu.add_command(label="使い方", command=self._show_help)
         help_menu.add_command(label="このツールについて", command=self._show_about)
         menu_bar.add_cascade(label="ヘルプ", menu=help_menu)
         self.root.config(menu=menu_bar)
+
+    def _export_normalized_logs(self) -> None:
+        if not self._last_normal_lines and not self._last_abnormal_lines:
+            messagebox.showinfo("正規化ログの保存", "先に解析を実行してください。")
+            return
+
+        directory = filedialog.askdirectory(
+            title="正規化ログの保存先フォルダを選択"
+        )
+        if not directory:
+            return
+
+        output_dir = Path(directory)
+        normal_path = output_dir / "normal.normalized.log"
+        abnormal_path = output_dir / "abnormal.normalized.log"
+        try:
+            self._write_normalized_log(normal_path, self._last_normal_lines)
+            self._write_normalized_log(abnormal_path, self._last_abnormal_lines)
+        except OSError as exc:
+            messagebox.showerror("保存エラー", str(exc))
+            return
+
+        messagebox.showinfo(
+            "保存完了",
+            "正規化ログを保存しました。\n\n"
+            f"正常: {normal_path}\n"
+            f"異常: {abnormal_path}",
+        )
+
+    @staticmethod
+    def _write_normalized_log(path: Path, lines: list[NormalizedLine]) -> None:
+        content = "\r\n".join(line.normalized_text for line in lines)
+        if lines:
+            content += "\r\n"
+        with path.open("w", encoding="utf-8-sig", newline="") as handle:
+            handle.write(content)
+
+    @staticmethod
+    def _normalization_config_path() -> Path:
+        return Path(__file__).resolve().parents[1] / "config" / "normalization.json"
+
+    def _show_normalization_settings(self) -> None:
+        window = tk.Toplevel(self.root)
+        window.title("正規化ルール設定")
+        window.geometry("980x560")
+        window.minsize(780, 440)
+        window.transient(self.root)
+
+        rules = self._load_normalization_rules()
+        selected_item: list[str | None] = [None]
+
+        outer = ttk.Frame(window, padding=12)
+        outer.pack(fill=tk.BOTH, expand=True)
+        ttk.Label(
+            outer,
+            text=(
+                "比較前にログから置き換える値を設定します。"
+                "ルールは上から順番に適用されます。"
+            ),
+            wraplength=900,
+        ).pack(anchor=tk.W, pady=(0, 8))
+
+        columns = ("name", "pattern", "replacement")
+        tree = ttk.Treeview(outer, columns=columns, show="headings", selectmode="browse")
+        tree.heading("name", text="ルール名")
+        tree.heading("pattern", text="正規表現")
+        tree.heading("replacement", text="置換文字列")
+        tree.column("name", width=160, stretch=False)
+        tree.column("pattern", width=500)
+        tree.column("replacement", width=220)
+        tree.pack(fill=tk.BOTH, expand=True)
+
+        for rule in rules:
+            tree.insert("", tk.END, values=(rule["name"], rule["pattern"], rule["replacement"]))
+
+        editor = ttk.LabelFrame(outer, text="ルール編集", padding=8)
+        editor.pack(fill=tk.X, pady=(10, 0))
+        name_var = tk.StringVar()
+        pattern_var = tk.StringVar()
+        replacement_var = tk.StringVar()
+        self._rule_entry(editor, 0, "ルール名", name_var)
+        self._rule_entry(editor, 1, "正規表現", pattern_var)
+        self._rule_entry(editor, 2, "置換文字列", replacement_var)
+
+        def select_rule(_event: object) -> None:
+            selection = tree.selection()
+            if not selection:
+                selected_item[0] = None
+                return
+            selected_item[0] = selection[0]
+            values = tree.item(selection[0], "values")
+            name_var.set(values[0])
+            pattern_var.set(values[1])
+            replacement_var.set(values[2])
+
+        def clear_editor() -> None:
+            selected_item[0] = None
+            name_var.set("")
+            pattern_var.set("")
+            replacement_var.set("")
+            tree.selection_remove(tree.selection())
+
+        def add_or_update() -> None:
+            name = name_var.get().strip()
+            pattern = pattern_var.get()
+            replacement = replacement_var.get()
+            try:
+                NormalizationRule.create(name, pattern, replacement)
+            except ValueError as exc:
+                messagebox.showerror("ルールエラー", str(exc), parent=window)
+                return
+            values = (name, pattern, replacement)
+            if selected_item[0] is None:
+                tree.insert("", tk.END, values=values)
+            else:
+                tree.item(selected_item[0], values=values)
+            clear_editor()
+
+        def delete_selected() -> None:
+            if selected_item[0] is not None:
+                tree.delete(selected_item[0])
+                clear_editor()
+
+        def save_rules() -> None:
+            payload = {
+                "rules": [
+                    {
+                        "name": tree.item(item, "values")[0],
+                        "pattern": tree.item(item, "values")[1],
+                        "replacement": tree.item(item, "values")[2],
+                    }
+                    for item in tree.get_children()
+                ]
+            }
+            try:
+                for rule in payload["rules"]:
+                    NormalizationRule.create(
+                        rule["name"], rule["pattern"], rule["replacement"]
+                    )
+                config_path = self._normalization_config_path()
+                config_path.parent.mkdir(parents=True, exist_ok=True)
+                with config_path.open("w", encoding="utf-8") as handle:
+                    json.dump(payload, handle, ensure_ascii=False, indent=2)
+            except (OSError, ValueError) as exc:
+                messagebox.showerror("保存エラー", str(exc), parent=window)
+                return
+            messagebox.showinfo(
+                "保存完了",
+                "正規化ルールを保存しました。次回の解析から反映されます。",
+                parent=window,
+            )
+
+        tree.bind("<<TreeviewSelect>>", select_rule)
+        buttons = ttk.Frame(editor)
+        buttons.grid(row=3, column=1, columnspan=2, sticky=tk.E, pady=(8, 0))
+        ttk.Button(buttons, text="追加／更新", command=add_or_update).pack(side=tk.LEFT, padx=3)
+        ttk.Button(buttons, text="選択行を削除", command=delete_selected).pack(side=tk.LEFT, padx=3)
+        ttk.Button(buttons, text="入力をクリア", command=clear_editor).pack(side=tk.LEFT, padx=3)
+        ttk.Button(buttons, text="保存", command=save_rules).pack(side=tk.LEFT, padx=3)
+        ttk.Button(buttons, text="閉じる", command=window.destroy).pack(side=tk.LEFT, padx=3)
+
+    @staticmethod
+    def _rule_entry(parent: ttk.LabelFrame, row: int, label: str, variable: tk.StringVar) -> None:
+        ttk.Label(parent, text=label, width=14).grid(row=row, column=0, sticky=tk.W, pady=3)
+        ttk.Entry(parent, textvariable=variable).grid(
+            row=row, column=1, columnspan=2, sticky=tk.EW, padx=(0, 8), pady=3
+        )
+        parent.columnconfigure(1, weight=1)
+
+    def _load_normalization_rules(self) -> list[dict[str, str]]:
+        try:
+            with self._normalization_config_path().open("r", encoding="utf-8") as handle:
+                payload = json.load(handle)
+            rules = payload.get("rules", []) if isinstance(payload, dict) else []
+            if isinstance(rules, list):
+                return [
+                    {
+                        "name": str(rule.get("name", "")),
+                        "pattern": str(rule.get("pattern", "")),
+                        "replacement": str(rule.get("replacement", "")),
+                    }
+                    for rule in rules
+                    if isinstance(rule, dict)
+                ]
+        except (OSError, json.JSONDecodeError, AttributeError, TypeError):
+            pass
+        return []
 
     def _refresh_views(self) -> None:
         if self._last_divergence is None:
@@ -261,6 +466,21 @@ class MainWindow:
             "■ 正規化後のログを見る\n"
             "上部メニューの「表示」→「正規化後のログを表示」を選ぶと、比較に使った文字列を表示できます。\n"
             "もう一度選ぶと元ログ表示に戻ります。\n\n"
+            "■ 正規化ログを保存する\n"
+            "解析後に「ファイル」→「正規化ログを保存」を選び、保存先フォルダを指定します。\n"
+            "次の2ファイルが作成されます。\n"
+            "  normal.normalized.log（正常ログの正規化結果）\n"
+            "  abnormal.normalized.log（異常ログの正規化結果）\n"
+            "保存した2ファイルはWinMergeなどで開いて、全体の差分を確認できます。\n"
+            "元ログは変更されません。\n\n"
+            "■ 正規化ルールを設定する\n"
+            "「設定」→「正規化ルール設定」を選びます。\n"
+            "各ルールには、ルール名・正規表現・置換文字列を指定します。\n"
+            "例: 正規表現「id=\\d+」、置換文字列「id=<ID>」\n"
+            "「追加／更新」で一覧に反映し、「保存」で設定ファイルに保存します。\n"
+            "ルールは一覧の上から順番に適用され、保存後の次回解析から反映されます。\n"
+            "Timestampと16進アドレスのルールは初期設定されています。\n"
+            "正規表現が不正な場合は保存できません。\n\n"
             "■ 差分の種類\n"
             "MISSING（欠落）\n"
             "  正常ログには存在する行が、異常ログで見つかりません。\n"
@@ -402,6 +622,8 @@ class MainWindow:
 
         self._last_divergence = divergence
         self._last_diff_result = diff_result
+        self._last_normal_lines = normal_lines
+        self._last_abnormal_lines = abnormal_lines
         self._render_context(
             self.normal_text,
             divergence.normal_context,
